@@ -3,10 +3,11 @@ spring:
     host: localhost
     port: 8989
 
+
 ustawienia:
-  numerIndeksu: 287046
+  numerIndeksu: 461011
   wycena: "CENY_BEZ_ZMIAN"
-  zamowienia: "POJEDYNCZE"
+  zamowienia: "REZERWACJE"
   zaopatrzenie: "POJEDYNCZE"
-  wydarzenia: "WYCOFANIE"
+  wydarzenia: "RAPORT_SPRZEDAŻY"
   liczbaZadan: 200

@@ -1,15 +1,7 @@
 package prs.project;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.EnumMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.stream.Stream;
-
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.http.HttpEntity;
 import org.apache.http.client.methods.CloseableHttpResponse;
@@ -25,18 +17,17 @@ import prs.project.controllers.Settings;
 import prs.project.model.Product;
 import prs.project.model.Warehouse;
 import prs.project.status.ReplyToAction;
-import prs.project.task.Akcja;
-import prs.project.task.SterowanieAkcja;
-import prs.project.task.Wycena;
-import prs.project.task.WycenaAkcje;
-import prs.project.task.Wydarzenia;
-import prs.project.task.WydarzeniaAkcje;
-import prs.project.task.Zamowienia;
-import prs.project.task.ZamowieniaAkcje;
-import prs.project.task.Zaopatrzenie;
-import prs.project.task.ZaopatrzenieAkcje;
+import prs.project.task.*;
 
-import com.fasterxml.jackson.databind.json.JsonMapper;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.stream.Stream;
+
+import static prs.project.task.SterowanieAkcja.ZAMKNIJ_SKLEP;
+import static prs.project.task.WycenaAkcje.PODAJ_CENE;
+import static prs.project.task.ZamowieniaAkcje.REZERWACJA;
+import static prs.project.task.ZaopatrzenieAkcje.POJEDYNCZE_ZAOPATRZENIE;
 
 @Service
 @Slf4j
@@ -50,11 +41,13 @@ public class ParallelExecutor {
     boolean active = true;
     Set<Enum> mojeTypy = new HashSet<>();
     ConcurrentLinkedDeque<Akcja> kolejka = new ConcurrentLinkedDeque();
+    ConcurrentLinkedDeque<Akcja> kolejkaIndependent = new ConcurrentLinkedDeque();
     Warehouse magazyn = new Warehouse();
     EnumMap<Product, Long> sprzedaz = new EnumMap(Product.class);
     EnumMap<Product, Long> rezerwacje = new EnumMap(Product.class);
     Long promoLicznik = 0L;
 
+    @SneakyThrows
     public ParallelExecutor(Settings settings, List<Akcja> akcje) {
         this.settings = settings;
         this.akcje = akcje;
@@ -66,37 +59,29 @@ public class ParallelExecutor {
         mojeTypy.addAll(Zaopatrzenie.valueOf(settings.getZaopatrzenie()).getAkceptowane());
         mojeTypy.addAll(Wydarzenia.valueOf(settings.getWydarzenia()).getAkceptowane());
         mojeTypy.addAll(Arrays.asList(SterowanieAkcja.values()));
-        Thread thread = new Thread(() ->
-        {
-            while (active) {
-                threadProcess();
-            }
-        });
+
+        Thread thread = new Thread(this::processStandardThread);
+        Thread thread2 = new Thread(this::processPodajCeneThread);
+
         thread.start();
-        Thread thread2 = new Thread(() ->
-        {
-            while (active) {
-                threadProcess();
-            }
-        });
         thread2.start();
     }
 
     public void process(Akcja jednaAkcja) {
+        List<Enum<? extends Enum<?>>> independentActions = Arrays.asList(PODAJ_CENE);
+
         Stream.of(jednaAkcja)
                 .filter(akcja -> mojeTypy.contains(akcja.getTyp()))
-                .forEach(akcja -> {
-                    kolejka.add(akcja);
-                });
+                .filter(akcja -> !independentActions.contains(akcja.getTyp()))
+                .forEach(akcja -> kolejka.add(akcja));
+
+        Stream.of(jednaAkcja)
+                .filter(akcja -> mojeTypy.contains(akcja.getTyp()))
+                .filter(akcja -> independentActions.contains(akcja.getTyp()))
+                .forEach(akcja -> kolejkaIndependent.add(akcja));
     }
 
-    public void threadProcess() {
-        Akcja akcja = null;
-        synchronized (this) {
-            if (!kolejka.isEmpty()) {
-                akcja = kolejka.pollFirst();
-            }
-        }
+    public void threadProcess(Akcja akcja) {
         if (akcja != null) {
             ReplyToAction odpowiedz = procesujAkcje(akcja);
             try {
@@ -107,6 +92,36 @@ public class ParallelExecutor {
         }
     }
 
+    private void processStandardThread() {
+        while (active) {
+            Akcja action = getStandardAction();
+            threadProcess(action);
+        }
+    }
+
+    private void processPodajCeneThread() {
+        while (active) {
+            Akcja action = getPodajCeneAction();
+            threadProcess(action);
+        }
+    }
+
+    private synchronized Akcja getStandardAction() {
+        if (!kolejka.isEmpty()) {
+            return kolejka.pollFirst();
+        }
+
+        return null;
+    }
+
+    private synchronized Akcja getPodajCeneAction() {
+        if (!kolejkaIndependent.isEmpty()) {
+            return kolejkaIndependent.pollFirst();
+        }
+
+        return null;
+    }
+
     private ReplyToAction procesujAkcje(Akcja akcja) {
         log.info("Procesuje " + akcja.getTyp());
         ReplyToAction odpowiedz = ReplyToAction.builder()
@@ -114,20 +129,11 @@ public class ParallelExecutor {
                 .id(akcja.getId())
                 .build();
 
-        if (WycenaAkcje.PODAJ_CENE.equals(akcja.getTyp())) {
-            odpowiedz.setProdukt(akcja.getProduct());
-            odpowiedz.setCena(magazyn.getCeny().get(akcja.getProduct()));
-            if (mojeTypy.contains(Wycena.PROMO_CO_10_WYCEN)) {
-                promoLicznik++;
-                if (promoLicznik == 10)
-                    odpowiedz.setCena(0L);
-            }
+        if (PODAJ_CENE.equals(akcja.getTyp())) {
+            executePodajCene(akcja, odpowiedz);
         }
         if (WycenaAkcje.ZMIEN_CENE.equals(akcja.getTyp())) {
-            magazyn.getCeny().put(akcja.getProduct(), akcja.getCena());
-            odpowiedz.setProdukt(akcja.getProduct());
-            odpowiedz.setCenaZmieniona(true);
-            odpowiedz.setCena(akcja.getCena());
+            executeZmienCene(akcja, odpowiedz);
         }
 
         if (WydarzeniaAkcje.RAPORT_SPRZEDAŻY.equals(akcja.getTyp())) {
@@ -137,97 +143,157 @@ public class ParallelExecutor {
             odpowiedz.setStanMagazynów(magazyn.getStanMagazynowy());
         }
         if (WydarzeniaAkcje.WYCOFANIE.equals(akcja.getTyp())) {
-            magazyn.getStanMagazynowy().put(akcja.getProduct(), -9999999L);
-            odpowiedz.setProdukt(akcja.getProduct());
-            odpowiedz.setZrealizowaneWycofanie(true);
+            executeWycofanie(akcja, odpowiedz);
         }
         if (WydarzeniaAkcje.PRZYWROCENIE.equals(akcja.getTyp())) {
-            magazyn.getStanMagazynowy().put(akcja.getProduct(), 0L);
-            odpowiedz.setProdukt(akcja.getProduct());
-            odpowiedz.setZrealizowanePrzywrócenie(true);
+            executePrzywrocenie(akcja, odpowiedz);
         }
 
         if (ZamowieniaAkcje.POJEDYNCZE_ZAMOWIENIE.equals(akcja.getTyp())) {
-            odpowiedz.setProdukt(akcja.getProduct());
-            odpowiedz.setLiczba(akcja.getLiczba());
-            Long naMagazynie = magazyn.getStanMagazynowy().get(akcja.getProduct());
-            if (naMagazynie >= akcja.getLiczba()) {
-                odpowiedz.setZrealizowaneZamowienie(true);
-                magazyn.getStanMagazynowy().put(akcja.getProduct(), naMagazynie - akcja.getLiczba());
-                sprzedaz.put(akcja.getProduct(), sprzedaz.get(akcja.getProduct()) + akcja.getLiczba());
-            } else {
-                odpowiedz.setZrealizowaneZamowienie(false);
-            }
+            executePojedynczeZamowienie(akcja, odpowiedz);
         }
         if (ZamowieniaAkcje.GRUPOWE_ZAMOWIENIE.equals(akcja.getTyp())) {
-            odpowiedz.setGrupaProduktów(akcja.getGrupaProduktów());
-            odpowiedz.setZrealizowaneZamowienie(true);
-            akcja.getGrupaProduktów().entrySet().stream()
-                    .forEach(produkt -> {
-                        Long naMagazynie = magazyn.getStanMagazynowy().get(produkt.getKey());
-                        if (naMagazynie < produkt.getValue()) {
-                            odpowiedz.setZrealizowaneZamowienie(false);
-                        }
-                    });
-            if (odpowiedz.getZrealizowaneZamowienie()) {
-                akcja.getGrupaProduktów().entrySet().stream()
-                        .forEach(produkt -> {
-                            Long naMagazynie = magazyn.getStanMagazynowy().get(produkt.getKey());
-                            magazyn.getStanMagazynowy().put(produkt.getKey(), naMagazynie - produkt.getValue());
-                            sprzedaz.put(produkt.getKey(), sprzedaz.get(produkt.getKey()) + produkt.getValue());
-                        });
-            }
+            executeGrupoweZamowienie(akcja, odpowiedz);
         }
-        if (ZamowieniaAkcje.REZERWACJA.equals(akcja.getTyp())) {
-            odpowiedz.setProdukt(akcja.getProduct());
-            odpowiedz.setLiczba(akcja.getLiczba());
-            Long naMagazynie = magazyn.getStanMagazynowy().get(akcja.getProduct());
-            if (naMagazynie >= akcja.getLiczba()) {
-                odpowiedz.setZrealizowaneZamowienie(true);
-                magazyn.getStanMagazynowy().put(akcja.getProduct(), naMagazynie - akcja.getLiczba());
-                rezerwacje.put(akcja.getProduct(), rezerwacje.get(akcja.getProduct()) + akcja.getLiczba());
-            } else {
-                odpowiedz.setZrealizowaneZamowienie(false);
-            }
+        if (REZERWACJA.equals(akcja.getTyp())) {
+            executeRezerwacja(akcja, odpowiedz);
         }
         if (ZamowieniaAkcje.ODBIÓR_REZERWACJI.equals(akcja.getTyp())) {
-            odpowiedz.setProdukt(akcja.getProduct());
-            odpowiedz.setLiczba(akcja.getLiczba());
-            Long naMagazynie = rezerwacje.get(akcja.getProduct());
-            if (naMagazynie >= akcja.getLiczba()) {
-                odpowiedz.setZrealizowaneZamowienie(true);
-                rezerwacje.put(akcja.getProduct(), rezerwacje.get(akcja.getProduct()) - akcja.getLiczba());
-            } else {
-                odpowiedz.setZrealizowaneZamowienie(false);
+            executeOdbiorRezerwacji(akcja, odpowiedz);
+        }
+
+        if (POJEDYNCZE_ZAOPATRZENIE.equals(akcja.getTyp())) {
+            executePojedynczeZaopatrzenie(akcja, odpowiedz);
+        }
+        if (ZaopatrzenieAkcje.GRUPOWE_ZAOPATRZENIE.equals(akcja.getTyp())) {
+            executeGrupoweZaopatrzenie(akcja, odpowiedz);
+        }
+
+        if (ZAMKNIJ_SKLEP.equals(akcja.getTyp())) {
+            synchronized (this) {
+                odpowiedz.setStanMagazynów(magazyn.getStanMagazynowy());
+                odpowiedz.setGrupaProduktów(magazyn.getCeny());
             }
         }
 
-        if (ZaopatrzenieAkcje.POJEDYNCZE_ZAOPATRZENIE.equals(akcja.getTyp())) {
-            odpowiedz.setProdukt(akcja.getProduct());
-            odpowiedz.setLiczba(akcja.getLiczba());
-            Long naMagazynie = magazyn.getStanMagazynowy().get(akcja.getProduct());
-            odpowiedz.setZebraneZaopatrzenie(true);
-            if(magazyn.getStanMagazynowy().get(akcja.getProduct()) >= 0) {
-                magazyn.getStanMagazynowy().put(akcja.getProduct(), naMagazynie + akcja.getLiczba());
-            }
+        log.info("Processed {} ", akcja.getTyp());
+        return odpowiedz;
+    }
+
+
+    private synchronized void executeGrupoweZaopatrzenie(Akcja akcja, ReplyToAction odpowiedz) {
+        odpowiedz.setGrupaProduktów(akcja.getGrupaProduktów());
+        odpowiedz.setZebraneZaopatrzenie(true);
+        akcja.getGrupaProduktów().entrySet().stream()
+                .forEach(produkt -> {
+                    Long naMagazynie = magazyn.getStanMagazynowy().get(produkt.getKey());
+                    if (magazyn.getStanMagazynowy().get(akcja.getProduct()) >= 0) {
+                        magazyn.getStanMagazynowy().put(produkt.getKey(), naMagazynie + produkt.getValue());
+                    }
+                });
+    }
+
+    private synchronized void executePojedynczeZaopatrzenie(Akcja akcja, ReplyToAction odpowiedz) {
+        odpowiedz.setProdukt(akcja.getProduct());
+        odpowiedz.setLiczba(akcja.getLiczba());
+        Long naMagazynie = magazyn.getStanMagazynowy().get(akcja.getProduct());
+        odpowiedz.setZebraneZaopatrzenie(true);
+        if (magazyn.getStanMagazynowy().get(akcja.getProduct()) >= 0) {
+            magazyn.getStanMagazynowy().put(akcja.getProduct(), naMagazynie + akcja.getLiczba());
         }
-        if (ZaopatrzenieAkcje.GRUPOWE_ZAOPATRZENIE.equals(akcja.getTyp())) {
-            odpowiedz.setGrupaProduktów(akcja.getGrupaProduktów());
-            odpowiedz.setZebraneZaopatrzenie(true);
+    }
+
+    @SneakyThrows
+    private synchronized void executeOdbiorRezerwacji(Akcja akcja, ReplyToAction odpowiedz) {
+        odpowiedz.setProdukt(akcja.getProduct());
+        odpowiedz.setLiczba(akcja.getLiczba());
+
+        Long naMagazynie = rezerwacje.get(akcja.getProduct());
+        if (naMagazynie >= akcja.getLiczba()) {
+            odpowiedz.setZrealizowaneZamowienie(true);
+            rezerwacje.put(akcja.getProduct(), rezerwacje.get(akcja.getProduct()) - akcja.getLiczba());
+        } else {
+            odpowiedz.setZrealizowaneZamowienie(false);
+        }
+    }
+
+    @SneakyThrows
+    private synchronized void executeRezerwacja(Akcja akcja, ReplyToAction odpowiedz) {
+        odpowiedz.setProdukt(akcja.getProduct());
+        odpowiedz.setLiczba(akcja.getLiczba());
+
+        Long naMagazynie = magazyn.getStanMagazynowy().get(akcja.getProduct());
+        if (naMagazynie >= akcja.getLiczba()) {
+            odpowiedz.setZrealizowaneZamowienie(true);
+            magazyn.getStanMagazynowy().put(akcja.getProduct(), naMagazynie - akcja.getLiczba());
+            rezerwacje.put(akcja.getProduct(), rezerwacje.get(akcja.getProduct()) + akcja.getLiczba());
+        } else {
+            odpowiedz.setZrealizowaneZamowienie(false);
+        }
+    }
+
+    private synchronized void executeGrupoweZamowienie(Akcja akcja, ReplyToAction odpowiedz) {
+        odpowiedz.setGrupaProduktów(akcja.getGrupaProduktów());
+        odpowiedz.setZrealizowaneZamowienie(true);
+        akcja.getGrupaProduktów().entrySet().stream()
+                .forEach(produkt -> {
+                    Long naMagazynie = magazyn.getStanMagazynowy().get(produkt.getKey());
+                    if (naMagazynie < produkt.getValue()) {
+                        odpowiedz.setZrealizowaneZamowienie(false);
+                    }
+                });
+        if (odpowiedz.getZrealizowaneZamowienie()) {
             akcja.getGrupaProduktów().entrySet().stream()
                     .forEach(produkt -> {
                         Long naMagazynie = magazyn.getStanMagazynowy().get(produkt.getKey());
-                        if(magazyn.getStanMagazynowy().get(akcja.getProduct()) >= 0) {
-                            magazyn.getStanMagazynowy().put(produkt.getKey(), naMagazynie + produkt.getValue());
-                        }
+                        magazyn.getStanMagazynowy().put(produkt.getKey(), naMagazynie - produkt.getValue());
+                        sprzedaz.put(produkt.getKey(), sprzedaz.get(produkt.getKey()) + produkt.getValue());
                     });
         }
+    }
 
-        if (SterowanieAkcja.ZAMKNIJ_SKLEP.equals(akcja.getTyp())) {
-            odpowiedz.setStanMagazynów(magazyn.getStanMagazynowy());
-            odpowiedz.setGrupaProduktów(magazyn.getCeny());
+    @SneakyThrows
+    private synchronized void executePojedynczeZamowienie(Akcja akcja, ReplyToAction odpowiedz) {
+        odpowiedz.setProdukt(akcja.getProduct());
+        odpowiedz.setLiczba(akcja.getLiczba());
+
+        Long naMagazynie = magazyn.getStanMagazynowy().get(akcja.getProduct());
+        if (naMagazynie >= akcja.getLiczba()) {
+            odpowiedz.setZrealizowaneZamowienie(true);
+            magazyn.getStanMagazynowy().put(akcja.getProduct(), naMagazynie - akcja.getLiczba());
+            sprzedaz.put(akcja.getProduct(), sprzedaz.get(akcja.getProduct()) + akcja.getLiczba());
+        } else {
+            odpowiedz.setZrealizowaneZamowienie(false);
         }
-        return odpowiedz;
+    }
+
+    private synchronized void executePrzywrocenie(Akcja akcja, ReplyToAction odpowiedz) {
+        magazyn.getStanMagazynowy().put(akcja.getProduct(), 0L);
+        odpowiedz.setProdukt(akcja.getProduct());
+        odpowiedz.setZrealizowanePrzywrócenie(true);
+    }
+
+    private synchronized void executeWycofanie(Akcja akcja, ReplyToAction odpowiedz) {
+        magazyn.getStanMagazynowy().put(akcja.getProduct(), -9999999L);
+        odpowiedz.setProdukt(akcja.getProduct());
+        odpowiedz.setZrealizowaneWycofanie(true);
+    }
+
+    private synchronized void executeZmienCene(Akcja akcja, ReplyToAction odpowiedz) {
+        magazyn.getCeny().put(akcja.getProduct(), akcja.getCena());
+        odpowiedz.setProdukt(akcja.getProduct());
+        odpowiedz.setCenaZmieniona(true);
+        odpowiedz.setCena(akcja.getCena());
+    }
+
+    private synchronized void executePodajCene(Akcja akcja, ReplyToAction odpowiedz) {
+        odpowiedz.setProdukt(akcja.getProduct());
+        odpowiedz.setCena(magazyn.getCeny().get(akcja.getProduct()));
+        if (mojeTypy.contains(Wycena.PROMO_CO_10_WYCEN)) {
+            promoLicznik++;
+            if (promoLicznik == 10)
+                odpowiedz.setCena(0L);
+        }
     }
 
     public void wyslijOdpowiedz(ReplyToAction odpowiedz) throws IOException {
@@ -243,7 +309,7 @@ public class ParallelExecutor {
         post.setHeader("Content-type", "application/json");
 
         try (CloseableHttpClient httpClient = HttpClients.createDefault();
-                CloseableHttpResponse response = httpClient.execute(post)) {
+             CloseableHttpResponse response = httpClient.execute(post)) {
 
             HttpEntity rEntity = response.getEntity();
             if (rEntity != null) {
@@ -261,7 +327,7 @@ public class ParallelExecutor {
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
-        if(SterowanieAkcja.ZAMKNIJ_SKLEP.equals(odpowiedz.getTyp())) {
+        if (ZAMKNIJ_SKLEP.equals(odpowiedz.getTyp())) {
             Warehouse magazyn = new Warehouse();
             EnumMap<Product, Long> sprzedaz = new EnumMap(Product.class);
             EnumMap<Product, Long> rezerwacje = new EnumMap(Product.class);

@@ -4,6 +4,7 @@ import javax.sound.midi.Sequence;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.Configuration;
@@ -28,6 +29,12 @@ public class RedisConfig {
     @Autowired ParallelExecutor parallelExecutor;
     @Autowired SequenceRunner sequenceRunner;
 
+    @Value("${spring.redis.host}")
+    private String redisHost;
+
+    @Value("${spring.redis.port}")
+    private int redisPort;
+
     @Bean
     ConcurrentHashMap<Long, Long> state() {
         return new ConcurrentHashMap<Long, Long>();
@@ -35,7 +42,10 @@ public class RedisConfig {
 
     @Bean
     JedisConnectionFactory jedisConnectionFactory() {
-        return new JedisConnectionFactory();
+        JedisConnectionFactory jedisConnectionFactory = new JedisConnectionFactory();
+        jedisConnectionFactory.setHostName(redisHost);
+        jedisConnectionFactory.setPort(redisPort);
+        return jedisConnectionFactory;
     }
 
     @Bean
