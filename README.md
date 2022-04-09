@@ -14,3 +14,9 @@ mvn clean install
 ```
 mvn test
 ```
+
+
+### Odpalanie redisa:
+```
+docker run -p 8989:6379 -d redis:6.0 redis-server
+```
